@@ -193,10 +193,102 @@ jobs:
             build/winamp-*.tar.gz
           if-no-files-found: error
           retention-days: 14
+  
+  build-appimage:
+    name: appimage-x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install build + AppImage dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build build-essential pkg-config \
+            qt6-base-dev qt6-multimedia-dev libqt6opengl6-dev libqt6multimediawidgets6 \
+            libgl-dev libprojectm-dev projectm-data libtag1-dev \
+            python3 file dpkg-dev wget \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
+            libxkbcommon0 libegl1 \
+            fuse libfuse2
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DWINAMP_DISTRO_ID=appimage
+
+      - name: Build
+        run: cmake --build build --parallel "$(nproc)"
+
+      - name: Test
+        run: |
+          export QT_QPA_PLATFORM=offscreen
+          ctest --test-dir build --output-on-failure
+
+      - name: Install into AppDir
+        run: |
+          rm -rf AppDir
+          mkdir -p AppDir
+          DESTDIR="$PWD/AppDir" cmake --install build --prefix /usr
+
+      - name: Fetch linuxdeploy and plugins
+        run: |
+          wget -c -nv \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage
+          # linuxdeploy discovers plugins as "linuxdeploy-plugin-<name>" on PATH — no .sh suffix.
+          wget -c -nv -O linuxdeploy-plugin-gstreamer \
+            https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gstreamer/master/linuxdeploy-plugin-gstreamer.sh
+          chmod +x linuxdeploy-plugin-gstreamer
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build AppImage (bundled Qt + GStreamer, no host deps)
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          ARCH: x86_64
+          # gst-plugins-bad carries some common audio elements not in good/ugly.
+          GSTREAMER_INCLUDE_BAD_PLUGINS: "1"
+        run: |
+          export PATH="$PWD:$PATH"
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --executable AppDir/usr/bin/winamp \
+            --desktop-file AppDir/usr/share/applications/winamp.desktop \
+            --icon-file icons/hicolor/256x256/apps/winamp.png \
+            --plugin qt \
+            --plugin gstreamer \
+            --output appimage
+
+      - name: List AppImage
+        run: ls -la ./*.AppImage
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: appimage-x86_64
+          path: ./*.AppImage
+          if-no-files-found: error
+          retention-days: 14
+
 
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, build-appimage]
     # Publish even if some matrix cells failed; only successful artifacts upload.
     if: always() && !cancelled() && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -207,10 +299,16 @@ jobs:
           path: dist
           pattern: packages-*
           merge-multiple: true
-
+      
+      - name: Download AppImage
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: appimage-x86_64
+          path: dist
+      
       - name: Show release bundle
         run: |
-          mapfile -t files < <(find dist -type f \( -name 'winamp-*.deb' -o -name 'winamp-*.rpm' -o -name 'winamp-*.tar.gz' \) | sort)
+          mapfile -t files < <(find dist -type f \( -name 'winamp-*.deb' -o -name 'winamp-*.rpm' -o -name 'winamp-*.tar.gz' -o -name '*.AppImage' \) | sort)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "No packages downloaded — all matrix builds failed?"
             exit 1
@@ -226,8 +324,8 @@ jobs:
             dist/winamp-*.deb
             dist/winamp-*.rpm
             dist/winamp-*.tar.gz
+            dist/*.AppImage
           draft: false
-          # beta / rc / alpha tags are prereleases; v1.0.0 is a full release
           prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') || contains(github.ref_name, 'alpha') }}
           generate_release_notes: true
           fail_on_unmatched_files: true
@@ -241,9 +339,8 @@ jobs:
             | **.deb** | Ubuntu 22.04, 24.04, Resolute · Debian Bookworm, Trixie |
             | **.rpm** | Fedora 41, 42 · openSUSE Tumbleweed |
             | **.tar.gz** | Same matrix (portable install layout) |
+            | **.AppImage** | Universal x86_64 build — bundles Qt + GStreamer (core and plugins), runs on any modern distro including Arch, with no system Qt/GStreamer install required |
 
-            Pick the package matching your distribution. Runtime codecs come from your system’s Qt Multimedia / GStreamer (or FFmpeg) stack.
-
-            Arch Linux is not packaged here (upstream projectM 4.x API mismatch); build from source if needed.
+            Pick the package matching your distribution, or grab the AppImage if you want a single portable binary. Non-AppImage packages use your system's Qt Multimedia / GStreamer (or FFmpeg) stack for codecs.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
