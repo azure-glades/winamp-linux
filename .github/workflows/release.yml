@@ -9,6 +9,12 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish GitHub Release"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -290,7 +296,7 @@ jobs:
     name: Publish GitHub Release
     needs: [build, build-appimage]
     # Publish even if some matrix cells failed; only successful artifacts upload.
-    if: always() && !cancelled() && startsWith(github.ref, 'refs/tags/v')
+    if: always() && !cancelled() && (startsWith(github.ref, 'refs/tags/v') || inputs.publish)
     runs-on: ubuntu-latest
     steps:
       - name: Download all packages
@@ -308,7 +314,7 @@ jobs:
       
       - name: Show release bundle
         run: |
-          mapfile -t files < <(find dist -type f \( -name 'winamp-*.deb' -o -name 'winamp-*.rpm' -o -name 'winamp-*.tar.gz' -o -name '*.AppImage' \) | sort)
+          mapfile -t files < <(find dist -type f \( -name 'winamp-*.deb' -o -name 'winamp-*.rpm' -o -name 'winamp-*.tar.gz' -o -name 'winamp-*.AppImage' \) | sort)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "No packages downloaded — all matrix builds failed?"
             exit 1
